@@ -1,0 +1,307 @@
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include "BluetoothSerial.h" // For ESP32 Bluetooth
+
+// --- Configuration Constants ---
+const int LCD_ADDR = 0x27;
+const int LCD_COLS = 16;
+const int LCD_ROWS = 2;
+
+// --- Pin Definitions ---
+const int keySwitchPin = 12; // Key switch for arming/disarming
+const int tamperPin1 = 14;   // First tamper wire (connected to GND)
+const int tamperPin2 = 25;   // Second tamper wire (connected to GND) - NOTE: GPIO 25 is used to avoid conflict with LCD on GPIO 22
+
+// --- Timing Constants ---
+// Time for a key press to register. 50ms is very fast but debounces electrical noise.
+const unsigned long KEY_SUSTAINED_DELAY_MS = 50; 
+// Minimum time between arm/defuse actions to prevent bouncing
+const unsigned long KEY_ACTION_COOLDOWN_MS = 1000;
+// Time a tamper wire must be broken to trigger detonation
+const unsigned long TAMPER_TRIGGER_DELAY_MS = 1000; // 1 second
+
+const long STARTING_MINUTES_DEFAULT = 180;
+const unsigned long ONE_MINUTE_MILLIS = 60000UL;
+const unsigned long TIME_UPDATE_INTERVAL_MILLIS = 30000UL;
+
+const String CMD_SET_TIMER_PREFIX = "SET_TIMER:";
+const String CMD_SUBTRACT_MINUTES_PREFIX = "SUBTRACT:";
+const String CMD_TIME_UPDATE_PREFIX = "TIME_UPDATE:";
+
+// --- Global Variables ---
+LiquidCrystal_I2C lcd(LCD_ADDR, LCD_COLS, LCD_ROWS);
+BluetoothSerial SerialBT;
+
+enum SystemState {
+    READY_TO_ARM,
+    ARMED_RUNNING,
+    DEFUSED,
+    TIME_UP
+};
+SystemState currentState = READY_TO_ARM;
+
+long currentSetStartingMinutes = STARTING_MINUTES_DEFAULT;
+long remainingMinutes = STARTING_MINUTES_DEFAULT;
+
+// Timing Variables
+unsigned long lastMinuteDecrementMillis = 0;
+unsigned long lastTimeUpdateSentMillis = 0;
+
+// Input Handling Variables
+bool lastReadKeyState = HIGH;
+bool confirmedKeyState = HIGH;
+unsigned long keyStateChangeTime = 0;
+unsigned long lastActionTime = 0;
+unsigned long tamperDisconnectTime = 0;
+
+// LCD Optimization Variables
+SystemState lastDisplayedState = (SystemState)-1;
+long lastDisplayedMinutes = -1;
+
+// --- Function Declarations ---
+void handleTamperDetection();
+
+// --- Setup ---
+void setup() {
+    Serial.begin(115200);
+    while (!Serial && millis() < 2000);
+    Serial.println("\n--- ESP32 Bomb Timer Initializing ---");
+
+    Wire.begin(); // Uses default I2C pins (SDA=21, SCL=22)
+    lcd.init();
+    lcd.backlight();
+    lcd.setCursor(0, 0); lcd.print("Initializing...");
+    delay(1000);
+
+    // Configure Key Switch
+    pinMode(keySwitchPin, INPUT_PULLUP);
+    bool initialKeyState = digitalRead(keySwitchPin);
+    lastReadKeyState = initialKeyState;
+    confirmedKeyState = initialKeyState;
+
+    // Configure the two tamper pins as inputs
+    pinMode(tamperPin1, INPUT_PULLUP);
+    pinMode(tamperPin2, INPUT_PULLUP);
+    Serial.println("Tamper wires initialized on GPIO14 and GPIO25.");
+
+    currentState = READY_TO_ARM;
+    remainingMinutes = currentSetStartingMinutes;
+    lastMinuteDecrementMillis = millis();
+
+    String deviceName = "ESP32_Casovac_Bomba";
+    if (!SerialBT.begin(deviceName)) {
+        Serial.println("!!! BT Init Error");
+        lcd.clear(); lcd.print("BT Init Error!");
+    } else {
+        Serial.println("Bluetooth Server Started: " + deviceName);
+    }
+    
+    updateLcdDisplay();
+    Serial.println("System ready to arm.");
+}
+
+// --- Main Loop ---
+void loop() {
+    handleKeyInput();
+    handleBluetoothInput();
+
+    if (currentState == ARMED_RUNNING) {
+        handleTamperDetection();
+        handleAutomaticTimerDecrement();
+        sendTimeUpdateToAndroid();
+    }
+
+    updateLcdDisplay();
+    delay(20);
+}
+
+// --- Tamper Detection Logic for Two Wires ---
+void handleTamperDetection() {
+    if (currentState != ARMED_RUNNING) return;
+
+    // A HIGH reading means a wire is disconnected. Check if EITHER wire is disconnected.
+    bool isTampered = (digitalRead(tamperPin1) == HIGH || digitalRead(tamperPin2) == HIGH);
+
+    if (isTampered) {
+        if (tamperDisconnectTime == 0) {
+            tamperDisconnectTime = millis();
+            Serial.println("!!! TAMPER DETECTED on one or more wires - 1s timer started!");
+        } else {
+            if (millis() - tamperDisconnectTime > TAMPER_TRIGGER_DELAY_MS) {
+                Serial.println("!!! TAMPERED FOR >1s. DETONATING!");
+                currentState = TIME_UP;
+            }
+        }
+    } else {
+        if (tamperDisconnectTime != 0) {
+            Serial.println("Tamper wires re-connected. Timer reset.");
+        }
+        tamperDisconnectTime = 0; // Reset the timer
+    }
+}
+
+// --- Key Input Handling ---
+void handleKeyInput() {
+    bool currentReading = digitalRead(keySwitchPin);
+
+    if (currentReading != lastReadKeyState) {
+        keyStateChangeTime = millis();
+        lastReadKeyState = currentReading;
+        return;
+    }
+
+    if (currentReading != confirmedKeyState && (millis() - keyStateChangeTime > KEY_SUSTAINED_DELAY_MS)) {
+        if (millis() - lastActionTime < KEY_ACTION_COOLDOWN_MS) {
+            return; // In cooldown, do nothing.
+        }
+        
+        confirmedKeyState = currentReading;
+        lastActionTime = millis();
+
+        // Key is turned ON (LOW) to arm
+        if (confirmedKeyState == LOW) {
+            if (currentState == READY_TO_ARM) armBomb();
+        } 
+        // Key is turned OFF (HIGH) to disarm
+        else {
+            if (currentState == ARMED_RUNNING) defuseBomb();
+        }
+    }
+}
+
+// --- Bomb Logic ---
+void armBomb() {
+    Serial.println("!!! BOMB ARMED !!!");
+    currentState = ARMED_RUNNING;
+    remainingMinutes = currentSetStartingMinutes;
+    lastMinuteDecrementMillis = millis();
+    lastTimeUpdateSentMillis = millis();
+    tamperDisconnectTime = 0;
+}
+
+void defuseBomb() {
+    Serial.println("!!! BOMB DEFUSED by key switch !!!");
+    currentState = DEFUSED;
+}
+
+// (The rest of the functions are unchanged and can be copied from the previous answer)
+// --- Timer Decrement Logic ---
+void handleAutomaticTimerDecrement() {
+    if (remainingMinutes <= 0) {
+        if (currentState == ARMED_RUNNING) {
+            currentState = TIME_UP;
+            Serial.println("!!! TIME'S UP !!!");
+        }
+        return;
+    }
+
+    if (millis() - lastMinuteDecrementMillis >= ONE_MINUTE_MILLIS) {
+        remainingMinutes--;
+        lastMinuteDecrementMillis = millis();
+        Serial.print("Timer decremented. Remaining: "); Serial.println(remainingMinutes);
+        if (remainingMinutes <= 0) {
+            remainingMinutes = 0;
+            currentState = TIME_UP;
+        }
+    }
+}
+
+// --- Bluetooth Input Handling ---
+void handleBluetoothInput() {
+    if (!SerialBT.available()) return;
+
+    String receivedString = SerialBT.readStringUntil('\n');
+    receivedString.trim();
+    if (receivedString.length() == 0) return;
+
+    Serial.print("BT Received: \""); Serial.print(receivedString); Serial.println("\"");
+
+    if (receivedString.startsWith(CMD_SET_TIMER_PREFIX)) {
+        String valueStr = receivedString.substring(CMD_SET_TIMER_PREFIX.length());
+        long newTime = valueStr.toInt();
+        if (newTime > 0 && newTime <= 9999) {
+            currentSetStartingMinutes = newTime;
+            if (currentState == READY_TO_ARM || currentState == ARMED_RUNNING) {
+                remainingMinutes = newTime;
+            }
+            if (currentState == ARMED_RUNNING) {
+                lastMinuteDecrementMillis = millis();
+            }
+            Serial.print("New timer base set to "); Serial.println(newTime);
+        }
+    } else if (receivedString.startsWith(CMD_SUBTRACT_MINUTES_PREFIX)) {
+        if (currentState != ARMED_RUNNING) return;
+        String valueStr = receivedString.substring(CMD_SUBTRACT_MINUTES_PREFIX.length());
+        long minutesToSubtract = valueStr.toInt();
+        if (minutesToSubtract > 0) {
+            remainingMinutes -= minutesToSubtract;
+            Serial.print("Subtracted "); Serial.print(minutesToSubtract); Serial.println(" minutes.");
+            if (remainingMinutes < 0) remainingMinutes = 0;
+        }
+    }
+}
+
+// --- Bluetooth Time Update Sender ---
+void sendTimeUpdateToAndroid() {
+    if (millis() - lastTimeUpdateSentMillis >= TIME_UPDATE_INTERVAL_MILLIS) {
+        if (SerialBT.hasClient()) {
+            String message = CMD_TIME_UPDATE_PREFIX + String(remainingMinutes) + "\n";
+            SerialBT.print(message);
+            Serial.print("BT Sent: "); Serial.print(message.substring(0, message.length() - 1));
+        }
+        lastTimeUpdateSentMillis = millis();
+    }
+}
+
+// --- LCD Helper ---
+void printLcdPadded(int col, int row, const String& text) {
+    lcd.setCursor(col, row);
+    lcd.print(text);
+    for (int i = text.length(); i < LCD_COLS; i++) {
+        lcd.print(" ");
+    }
+}
+
+// --- LCD Display Logic ---
+void updateLcdDisplay() {
+    if (currentState != lastDisplayedState) {
+        lcd.clear();
+        String line1, line2;
+        switch (currentState) {
+            case READY_TO_ARM:
+                line1 = "BOMBA PRIPRAVENA";
+                line2 = "Start: " + String(currentSetStartingMinutes) + " min";
+                break;
+            case ARMED_RUNNING:
+                line1 = "Zbyva cas:";
+                line2 = String(remainingMinutes) + " min";
+                break;
+            case DEFUSED:
+                line1 = "    BOMBA";
+                line2 = "  ZNESKODNENA";
+                break;
+            case TIME_UP:
+                line1 = "!!!! CAS !!!!";
+                line2 = "!!!! VYPRSEL !!!!";
+                break;
+        }
+        printLcdPadded(0, 0, line1);
+        printLcdPadded(0, 1, line2);
+
+        lastDisplayedState = currentState;
+        lastDisplayedMinutes = remainingMinutes;
+    }
+    else if ((currentState == ARMED_RUNNING && remainingMinutes != lastDisplayedMinutes) ||
+             (currentState == READY_TO_ARM && currentSetStartingMinutes != lastDisplayedMinutes)) {
+        
+        String timeStr;
+        if (currentState == ARMED_RUNNING) {
+            timeStr = String(remainingMinutes) + " min";
+            lastDisplayedMinutes = remainingMinutes;
+        } else {
+            timeStr = "Start: " + String(currentSetStartingMinutes) + " min";
+            lastDisplayedMinutes = currentSetStartingMinutes;
+        }
+        printLcdPadded(0, 1, timeStr);
+    }
+}
